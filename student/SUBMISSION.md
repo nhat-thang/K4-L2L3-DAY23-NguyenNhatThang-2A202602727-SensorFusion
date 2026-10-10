@@ -4,10 +4,10 @@
 
 ## Thông tin học viên
 
-- Họ tên:
-- MSSV:
-- Email:
-- Link repo (fork):
+- Họ tên: Nguyễn Nhật Thắng
+- MSSV: 2A202602727
+- Email: junifoca1331@gmail.com
+- Link repo (fork): https://github.com/nhat-thang/K4-L2L3-DAY23-NguyenNhatThang-2A202602727-SensorFusion
 - Commit hash nộp (`git rev-parse HEAD`):
 
 ## Tóm tắt kết quả
