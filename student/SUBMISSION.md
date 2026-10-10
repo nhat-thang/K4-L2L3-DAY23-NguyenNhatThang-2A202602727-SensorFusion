@@ -16,7 +16,7 @@
 - `detection.precision`, `detection.recall`, `detection.tp/fp/fn`: 0.9701, 0.7004, 519 / 16 / 222
 - `tracking.lidar.rmse`, `matches`, `sum_sq_err`, `ghost_track_frames`, `missed_gt_frames`, `mean_confirmed_tracks`: 0.1503 m, 502, 11.3436, 0, 239, 2.5226
 - `tracking.fused.rmse`, `matches`, `sum_sq_err`, `ghost_track_frames`, `missed_gt_frames`, `mean_confirmed_tracks`: 0.1359 m, 502, 9.2668, 0, 239, 2.5226
-- Giải thích khác biệt hai mode, đọc RMSE cùng số ghép và ghost/miss: hai mode có cùng `matches` (502), `ghost_track_frames` (0), `missed_gt_frames` (239) và `mean_confirmed_tracks`, vì chỉ lượt LiDAR quyết định tạo/xác nhận/xoá track nên tập track confirmed giống hệt nhau. Khác biệt chỉ nằm ở độ chính xác vị trí: update camera thêm thông tin góc ngang/dọc, kéo trạng thái EKF gần GT hơn nên `sum_sq_err` giảm từ 11.34 xuống 9.27 và RMSE giảm 0.150 → 0.136 m (tốt hơn ~0.014 m, nằm trong ngưỡng không xấu hơn 0.05 m). 239 frame GT bị miss chủ yếu do recall detector 0.70 (222 FN): xe không được detect thì không có track, camera không bù được vì không được sinh track.
+- Giải thích khác biệt hai mode, đọc RMSE cùng số ghép và ghost/miss: số ghép (502), ghost (0), miss (239) và số track confirmed trung bình của 2 mode y hệt nhau. Lý do là camera không được tạo/xoá track hay cộng trừ score, nên danh sách track ở 2 mode là một. Cái khác duy nhất là vị trí: có thêm update camera thì track nằm sát xe thật hơn một chút, sum_sq_err giảm từ 11.34 còn 9.27, RMSE từ 0.150 xuống 0.136 m. Còn 239 frame miss thì phần lớn do detector bỏ sót (recall chỉ 0.70, 222 FN). Xe nào LiDAR không detect được thì không có track, camera cũng không cứu được.
 
 Chạy từ root repo:
 
@@ -39,43 +39,42 @@ File per-mode `metrics_lidar.json`, `metrics_fused.json`, `grade_run_lidar.log`,
 ## Giải thích ngắn (Parts E–H — tự viết)
 
 1. Khác biệt đo lidar 3D và camera 2D trong EKF (`z`, `R`)?
-   LiDAR đo trực tiếp vị trí 3D `z = (x, y, z)` (mét), `R = diag(0.1², 0.1², 0.1²)`, mô hình đo
-   tuyến tính `h(x) = R_vs·p + t` nên `H` là ma trận 3×6 hằng (phần vận tốc bằng 0). Camera đo
-   pixel `z = (u, v)`, `R = diag(5², 5²)` px², mô hình pinhole `u = c_i − f_i·y_s/x_s`,
-   `v = c_j − f_j·z_s/x_s` là phi tuyến (chia cho độ sâu) nên `H` là Jacobian 2×6 tính tại `x`
-   hiện tại. Camera không đo được độ sâu, chỉ ràng buộc hướng nhìn; LiDAR ràng buộc cả 3 trục.
+   LiDAR cho luôn vị trí 3D của tâm hộp, `z = (x, y, z)` tính bằng mét, `R` là đường chéo 0.1².
+   Hàm đo chỉ là đổi hệ toạ độ nên tuyến tính, `H` là ma trận 3×6 cố định (3 cột vận tốc = 0).
+   Camera thì cho pixel `z = (u, v)`, `R` là đường chéo 5² (px²). Để ra pixel phải chiếu pinhole,
+   có chia cho độ sâu `x_s`, nên không tuyến tính, phải tính Jacobian tại trạng thái hiện tại.
+   Camera không biết xe cách bao xa, chỉ biết xe nằm theo hướng nào.
 2. Vì sao cần gating Mahalanobis trước khi gán?
-   `d² = γᵀ S⁻¹ γ` chuẩn hoá residual theo bất định `S = HPHᵀ + R`, nên so sánh được giữa các
-   track có `P` khác nhau và giữa mét/pixel. Với γ Gauss, `d²` theo phân phối χ² bậc = số chiều
-   đo (3 cho LiDAR, 2 cho camera); cổng `χ²(0.995)` loại các cặp quá khó xảy ra. Nếu không gate,
-   greedy sẽ ghép cả cặp sai ở xa (một xe với detection của xe khác/FP), EKF update kéo track lệch
-   và track đáng lẽ miss lại được cộng score.
+   Khoảng cách Euclid thường không tính đến độ bất định. Mahalanobis `d² = γᵀ S⁻¹ γ` chia residual
+   cho `S`, nên track mới (P to) được phép lệch nhiều hơn track đã ổn định, và so được cả mét lẫn
+   pixel. `d²` theo phân phối χ² với bậc tự do bằng số chiều đo, nên lấy ngưỡng χ² 99.5% để loại
+   các cặp vô lý. Không gate thì greedy có thể ghép track với detection của xe khác hoặc FP,
+   track bị kéo lệch mà còn được tính là hit.
 3. Pipeline là track-then-fuse hay fuse-then-track? Chỉ ra trên log `fusion-run-lab`.
-   Track-then-fuse: mỗi frame trong `run_lab.run` gọi `KF.predict` một lần cho mọi track, rồi
-   `associate_and_update(..., lidar_sensor)` (AssocL), sau đó mới `associate_and_update(...,
-   camera_sensor)` (AssocC) trên cùng tập track. Đo hai sensor không được gộp trước; chúng update
-   tuần tự một EKF. Trên log: `grade_run_lidar.log` và `grade_run_fused.log` có `confirmed`,
-   `matches`, `ghosts`, `misses` giống hệt nhau từng frame, chỉ `sum_sq_err` khác — camera chỉ tinh
-   chỉnh trạng thái của track đã có từ LiDAR.
+   Track-then-fuse. Trong `run_lab.py` mỗi frame predict tất cả track 1 lần, update bằng LiDAR
+   trước (AssocL), xong mới tới camera (AssocC) trên chính các track đó. Không có bước gộp đo
+   LiDAR với camera trước khi track. Nhìn log cũng thấy: so `grade_run_lidar.log` với
+   `grade_run_fused.log` thì 199 frame đều có `confirmed`, `matches`, `ghosts`, `misses` giống
+   nhau, chỉ `sum_sq_err` khác. Tức là camera chỉ chỉnh lại vị trí track mà LiDAR đã tạo.
 4. Nếu camera lệch calibration, triệu chứng gì trên innovation/residual?
-   Innovation camera `γ = z − h(x)` sẽ có độ lệch hệ thống (trung bình khác 0, cùng dấu qua nhiều
-   frame và nhiều xe) thay vì nhiễu quanh 0; `d²` trung bình tăng lên trên mức kỳ vọng (≈ 2 với
-   đo 2 chiều). Hậu quả: nhiều cặp bị gate loại (ít camera update), các cặp còn lại kéo track lệch
-   khỏi vị trí LiDAR, residual LiDAR ngay sau đó cũng tăng và RMSE fused có thể xấu hơn LiDAR-only.
+   Residual camera sẽ bị lệch về một phía, kiểu frame nào xe nào cũng lệch vài chục pixel cùng
+   chiều, chứ không còn dao động quanh 0 nữa. `d²` trung bình cao hơn mức bình thường (khoảng 2
+   với đo 2 chiều), nhiều cặp bị cổng loại. Những cặp vẫn lọt qua thì kéo track sai chỗ, tới lượt
+   LiDAR sau residual LiDAR cũng lớn lên, và RMSE fused có thể còn tệ hơn chạy LiDAR một mình.
 5. Vì sao `associate_and_update(..., sensor)` cần sensor tường minh ở frame rỗng?
    Giải thích vì sao lidar quyết định score/init/delete còn camera chỉ EKF update.
-   Khi `meas_list` rỗng thì không suy ra sensor từ `meas.sensor` được, nhưng vẫn phải gọi
-   `manage_tracks` để biết đây là lượt LiDAR: mọi track trong FOV bị tính miss (−1/window) và có
-   thể bị xoá. Nếu bỏ qua frame rỗng, track ma sẽ sống mãi. LiDAR đo vị trí 3D đầy đủ và có detector
-   thật, nên là nguồn đáng tin về sự tồn tại; camera trong lab là tâm hộp 2D không có độ sâu,
-   không đủ để khởi tạo trạng thái 3D, và FOV hẹp hơn — nếu camera trừ score thì track ngoài/rìa
-   ảnh bị xoá oan. Vì vậy camera chỉ cập nhật `x`, `P`.
+   Frame không có detection nào thì `meas_list` rỗng, không lấy được `meas.sensor`. Nhưng frame
+   đó vẫn phải đi qua `manage_tracks` như một lượt LiDAR để các track trong FOV bị trừ điểm miss,
+   không thì track ma không bao giờ bị xoá. Còn vì sao chỉ LiDAR được quyết định: LiDAR có
+   detector thật và đo đủ 3D nên đủ tin để tạo track. Camera trong lab chỉ có tâm hộp 2D, không có
+   độ sâu thì không khởi tạo được vị trí 3D, FOV lại hẹp, nếu cho camera trừ điểm thì xe ở ngoài
+   ảnh bị xoá oan. Nên camera chỉ dùng để update `x` và `P`.
 6. Nêu điều kiện xác nhận, giữ confirmed sau miss, và điều kiện xóa track.
-   Track mới: `score = 1/6`, `initialized`. Mỗi lượt LiDAR: hit → `score = min(score + 1/6, 1)`
-   và track chưa confirmed thành `tentative`; miss trong FOV → `score −= 1/6`. Xác nhận khi
-   `score > 0.8` (strict). Đã `confirmed` thì không bị hạ trạng thái khi miss; chỉ bị xoá khi
-   `score < 0.6`. Track chưa confirmed bị xoá khi `score ≤ 0`. Ngoài ra xoá bất kể score khi
-   `P[0,0] > 9` hoặc `P[1,1] > 9` (σ vị trí ngang > 3 m).
+   Track mới có score 1/6, trạng thái `initialized`. Mỗi lượt LiDAR, ghép được thì +1/6 (tối đa
+   1) và chuyển `tentative` nếu chưa confirmed; miss mà track nằm trong FOV thì −1/6. Score > 0.8
+   (lớn hơn hẳn) thì thành `confirmed`. Confirmed rồi thì miss vài lần vẫn giữ confirmed, chỉ xoá
+   khi score < 0.6. Track chưa confirmed thì xoá khi score ≤ 0. Ngoài ra nếu P[0,0] hoặc P[1,1]
+   > 9 (lệch chuẩn hơn 3 m) thì xoá luôn, không cần xét score.
 
 ## Bonus (không bắt buộc)
 
@@ -89,7 +88,7 @@ Liệt kê phần bonus đã làm, file bằng chứng trong `student/bonus/` v�
 Ghi rõ, kể cả khi không dùng ("Không dùng AI"). Xem [RULES.md](../RULES.md) mục 2.
 
 - Công cụ đã dùng (ChatGPT, Copilot, Claude, …): Claude Code (Claude Opus 5.5)
-- Dùng cho phần nào (hàm, câu hỏi, debug): sắp xếp thư mục dữ liệu và cài môi trường (CP0); implement Part E–H (`kalman.py`, `camera_fusion.py`, `association.py`, `track_management.py`); debug lỗi encoding cp1252 trên Windows và lỗi `float()` với ma trận 1×1; soạn nháp phần tóm tắt và 6 câu giải thích (đã đọc lại và chỉnh theo hiểu biết của mình).
+- Dùng cho phần nào (hàm, câu hỏi, debug): sắp xếp thư mục dữ liệu và cài môi trường (CP0); implement Part E–H (`kalman.py`, `camera_fusion.py`, `association.py`, `track_management.py`); debug lỗi encoding cp1252 trên Windows và lỗi `float()` với ma trận 1×1; viết phần giải thích kết quả và 6 câu trả lời E–H.
 - Cách bạn đã kiểm tra lại (pytest, chạy Waymo, đối chiếu công thức): `pytest student/tests -q` (128 passed, không failed/xfailed); chạy `fusion-run-lab --fusion compare --seed 0` trên frame 0–198, số liệu lấy từ `metrics.json`; đối chiếu công thức EKF/pinhole/χ² với docs/HUONG_DAN_KY_THUAT.md §2.
 
 ## Checklist nộp
